@@ -3,7 +3,8 @@ import pandas as pd
 
 class stdev_soln:
     """
-    Class to compute rolling standard deviation of price data and track continuity.
+    Class for calculating rolling standard deviations of price data for multiple
+    securities, considering only contiguous time windows.
 
     Attributes
     ----------
@@ -12,8 +13,7 @@ class stdev_soln:
     timestep : pd.Timedelta
         Expected time difference between consecutive snapshots (default 1 hour).
     state : pd.DataFrame
-        Stores both raw_price and rolling_stdev data with a MultiIndex on columns: 
-        level 0 = 'raw_price' or 'rolling_stdev', level 1 = original column names.
+        Stores original price data and calculated rolling standard deviations.
     """
     
     def __init__(self, window=20, timestep=pd.Timedelta('1hr')):
@@ -31,9 +31,44 @@ class stdev_soln:
         self.timestep = timestep
         self.state = pd.DataFrame()
 
+    def rolling_stdev(self, df):
+        """
+        Calculates the rolling standard deviation for each security in the 
+        DataFrame, only for windows where the `snap_time` values are contiguous.
+    
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Price data indexed by ('security_id', 'snap_time').
+    
+        Returns
+        -------
+        pd.DataFrame
+            Rolling standard deviations for contiguous windows
+        """
+        # check if time-series contiguous
+        df = df.dropna().sort_index()
+        df['cont'] = df.index.get_level_values(1).to_series().groupby(
+            df.index.get_level_values(0)).diff().eq(self.timestep).values
+        
+        # rolling_stdev
+        df_agg = pd.concat([
+            # rolling_stdev
+            df.groupby('security_id')[df.columns[:-1]]\
+                .rolling(self.window).std(),
+            # check if contiguous
+            df.groupby('security_id')[['cont']]\
+                .rolling(self.window-1).min().astype('boolean'),
+        ], axis=1, ignore_index=False)
+
+        # only return contiguous windows
+        df_agg = df_agg[df_agg['cont'] == True].drop(columns='cont') 
+        df_agg = df_agg.droplevel(0).add_suffix('_std')
+        return df_agg
+
     def calculate(self, fname):
         """
-        Read price data, compute rolling standard deviation, and check time-contiguity.
+        Load price data from a file and compute rolling standard deviations.
 
         Parameters
         ----------
@@ -43,64 +78,62 @@ class stdev_soln:
         # read time-series data
         df = pd.read_parquet(fname)
         df['snap_time'] = pd.to_datetime(df['snap_time'])
-
-        # check if time-series contiguous
-        df = df.sort_values(by=['security_id', 'snap_time']).reset_index(drop=True)
-        df['cont'] = (df.groupby('security_id')['snap_time'].diff() == self.timestep)
-
-        # rolling_stdev
-        df_agg = pd.concat([
-            # index
-            df[['snap_time', 'security_id']],
-            # rolling_stdev
-            df.groupby('security_id')[['bid', 'mid', 'ask']]\
-                .rolling(self.window).std().reset_index(drop=True),
-            # check if contiguous
-            df.groupby('security_id')[['cont']].rolling(self.window-1)\
-                .min().astype('boolean').reset_index(drop=True),
-        ], axis=1, ignore_index=False)
-
-        # save both raw and rolling as state
         df = df.set_index(['security_id', 'snap_time'])
-        df.columns = pd.MultiIndex.from_product([['raw_price'], df.columns])
-        df_agg = df_agg.set_index(['security_id', 'snap_time'])
-        df_agg.columns = pd.MultiIndex.from_product([['rolling_stdev'], df_agg.columns])
-        self.state = df.join(df_agg, how='outer')
+
+        # calculate for each column
+        for i in df.columns:
+            df = df.join(self.rolling_stdev(df[[i]].dropna()), how='outer')
+
+        self.state = df
 
     def get_state(self):
         """
-        Return the current stored state of raw_price and rolling_stdev data.
+        Return the current stored state of raw prices and calculated rolling 
+        standard deviations.
 
         Returns
         -------
         pd.DataFrame
-            MultiIndexed DataFrame containing 'raw_price' and 'rolling_stdev' 
-            data for each security and timestamp.
+            DataFrame containing raw prices and rolling standard deviations
         """
         return self.state
 
-    def output(self, start=None, end=None, fname=None):
+    def output(self, start=None, end=None, security_id=None, fname=None):
         """
-        Filter rolling data by optional time range and/or write to CSV.
+        Calculates the most recent rolling standard deviations for the specified
+        securities and time range, and optionally saving to CSV.
 
         Parameters
         ----------
-        fname : str, optional
-            Path to save CSV file (if None, file is not written).
         start : pd.Timestamp or str, optional
-            Start timestamp for filtering rows (inclusive). If None, no lower bound.
+            Start timestamp for constructing the time index. If None, uses the 
+            earliest timestamp in the data.
         end : pd.Timestamp or str, optional
-            End timestamp for filtering rows (inclusive). If None, no upper bound.
+            End timestamp for constructing the time index. If None, uses the 
+            earliest timestamp in the data.
+        security_id : list of str, optional
+            Security ID(s) to filter. If None, includes all securities.
+        fname : str, optional
+            Path to save CSV file. If None, file is not written.
 
         Returns
         -------
         pd.DataFrame
-            Filtered rolling_stdev DataFrame with columns ['bid', 'mid', 'ask'].
+            DataFrame of most recent rolling standard deviations.
         """
-        out = self.state['rolling_stdev']
-        out = out[out['cont'] == True][['bid', 'mid', 'ask']]
-        if start != None: out = out[out.index.get_level_values('snap_time') >= start]
-        if end != None: out = out[out.index.get_level_values('snap_time') <= end]
+        # default arguments
+        start = start or self.state.index.get_level_values('snap_time').min()
+        end = end or self.state.index.get_level_values('snap_time').max()
+        security_id = security_id or self.state.index.get_level_values('security_id').unique()
+
+        # create every possible snap_time
+        out = pd.DataFrame(index=pd.MultiIndex.from_product(
+            [security_id, pd.date_range(start=start, end=end, freq=self.timestep)], 
+        names=['security_id', 'snap_time']))
+        
+        # get stdev
+        out = out.join(self.state.filter(regex='_std$'), how='left')
+        out = out.ffill() # if stdev not available, use last most recent value
         if fname != None: out.to_csv(fname)
         return out
 
