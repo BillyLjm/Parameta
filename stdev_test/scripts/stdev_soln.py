@@ -97,7 +97,8 @@ class stdev_soln:
         pd.DataFrame
             Filtered rolling_stdev DataFrame with columns ['bid', 'mid', 'ask'].
         """
-        out = self.state['rolling_stdev'][['bid', 'mid', 'ask']]
+        out = self.state['rolling_stdev']
+        out = out[out['cont'] == True][['bid', 'mid', 'ask']]
         if start != None: out = out[out.index.get_level_values('snap_time') >= start]
         if end != None: out = out[out.index.get_level_values('snap_time') <= end]
         if fname != None: out.to_csv(fname)
